@@ -1,4 +1,4 @@
-;; 3Ding GitHub setup - Copyright (c) 2026 Denon Deterding.
+;; GitLISP online installer v2 - Copyright (c) 2026 Denon Deterding.
 ;; Licensed under the MIT License. See LICENSE.
 (vl-load-com)
 
@@ -205,7 +205,7 @@
 
 ;; paths/state - setup metadata. Returns T when this profile has both trust entries.
 ;; Preserves existing paths and records only entries the installer adds.
-(defun GitHub_SetupTrust (paths state / key entries keys additions wanted records old result)
+(defun GitHub_SetupTrust (paths state / key entries keys additions wanted records old result owned)
   (setq key (GitHub_SetupProfileKey)
     entries (GitHub_SetupSplit (getvar "TRUSTEDPATHS"))
     keys (mapcar 'GitHub_SetupPathKey entries)
@@ -224,11 +224,21 @@
     (t
       (setq records (cdr (assoc "profiles" state)) old (assoc key records))
       (if old
-        (setq records (subst (cons key (append (cdr old) (reverse additions))) old records))
+        (progn
+          (setq owned (cdr old))
+          (foreach wanted (reverse additions)
+            (if (not (member (GitHub_SetupPathKey wanted) (mapcar 'GitHub_SetupPathKey owned)))
+              (setq owned (append owned (list wanted)))
+            )
+          )
+          (setq records (subst (cons key owned) old records))
+        )
         (setq records (cons (cons key (reverse additions)) records))
       )
-      (setq state (subst (cons "profiles" records) (assoc "profiles" state) state))
-      (if (GitHub_SetupWriteState state paths)
+      (if (or
+          (equal records (cdr (assoc "profiles" state)))
+          (GitHub_SetupWriteState (subst (cons "profiles" records) (assoc "profiles" state) state) paths)
+        )
         (progn
           (setq result (vl-catch-all-apply 'setvar (list "TRUSTEDPATHS" (GitHub_SetupJoin entries))))
           (if (vl-catch-all-error-p result)
@@ -437,6 +447,203 @@
   (and (not (vl-catch-all-error-p result)) result)
 )
 
+;; ref - branch, tag, or commit text. Returns T for a supported deployment ref.
+(defun GitHub_SetupValidRef (ref)
+  (and
+    (= (type ref) 'STR)
+    (<= 1 (strlen ref) 200)
+    (null (vl-string-search ".." ref))
+    (vl-every
+      '(lambda (n)
+        (or (<= 48 n 57) (<= 65 n 90) (<= 97 n 122) (member n '(45 46 47 64 43 95)))
+      )
+      (vl-string->list ref)
+    )
+  )
+)
+
+;; ref - validated ASCII Git ref. Returns a single escaped URL path component.
+(defun GitHub_SetupEscapeRef (ref / result n)
+  (setq result "")
+  (foreach n (vl-string->list ref)
+    (setq result
+      (strcat result
+        (if (or (<= 48 n 57) (<= 65 n 90) (<= 97 n 122) (member n '(45 46 95)))
+          (chr n)
+          (strcat "%"
+            (substr "0123456789ABCDEF" (1+ (fix (/ n 16))) 1)
+            (substr "0123456789ABCDEF" (1+ (rem n 16)) 1)
+          )
+        )
+      )
+    )
+  )
+  result
+)
+
+;; url - fixed GitHub API/raw URL; accept - requested response type.
+;; Returns HTTP body/bytes on success, or nil. GITLISP_TOKEN is optional and never saved.
+(defun GitHub_SetupRequest (url accept / http result token body)
+  (setq token (getenv "GITLISP_TOKEN"))
+  (cond
+    ((not
+        (or
+          (= (substr url 1 23) "https://api.github.com/")
+          (= (substr url 1 34) "https://raw.githubusercontent.com/")
+        )
+      )
+      (prompt "\nGitLISP: blocked an unexpected download URL.")
+      nil
+    )
+    ((and
+        token
+        (/= token "")
+        (not (vl-every '(lambda (n)
+              (<= 33 n 126)
+            ) (vl-string->list token)
+          )
+        )
+      )
+      (prompt "\nGitLISP: GITLISP_TOKEN has an invalid format.")
+      nil
+    )
+    (t
+      (setq http (vl-catch-all-apply 'vlax-create-object '("WinHttp.WinHttpRequest.5.1")))
+      (if (and http (not (vl-catch-all-error-p http)))
+        (progn
+          (setq result
+            (vl-catch-all-apply
+              '(lambda ()
+                (vlax-invoke-method http 'SetTimeouts 5000 5000 10000 30000)
+                (vlax-invoke-method http 'Open "GET" url :vlax-false)
+                (vlax-put-property http 'Option 6 :vlax-false)
+                (vlax-invoke-method http 'SetRequestHeader "User-Agent" "GitLISP-Installer")
+                (vlax-invoke-method http 'SetRequestHeader "Accept" accept)
+                (vlax-invoke-method http 'SetRequestHeader "X-GitHub-Api-Version" "2026-03-10")
+                (if (and token (/= token ""))
+                  (vlax-invoke-method http 'SetRequestHeader "Authorization" (strcat "Bearer " token))
+                )
+                (vlax-invoke-method http 'Send)
+                (if (= 200 (vlax-get-property http 'Status))
+                  (progn
+                    (setq body (vl-catch-all-apply 'vlax-get-property (list http 'ResponseText)))
+                    (list
+                      (cons "text" (if (vl-catch-all-error-p body)
+                          ""
+                          body
+                        )
+                      )
+                      (cons "bytes" (vlax-get-property http 'ResponseBody))
+                    )
+                  )
+                  (progn
+                    (prompt (strcat "\nGitLISP: download returned HTTP "
+                        (itoa (vlax-get-property http 'Status))
+                        ". Check the published revision and repository access."
+                      )
+                    )
+                    nil
+                  )
+                )
+              )
+            )
+          )
+          (vlax-release-object http)
+          (setq token nil)
+          (if (not (vl-catch-all-error-p result))
+            result
+          )
+        )
+      )
+    )
+  )
+)
+
+;; ref - validated branch/tag/SHA. Returns a pinned 40-character SHA, or nil.
+(defun GitHub_SetupCommit (ref / response sha)
+  (if (and
+      (= (strlen ref) 40)
+      (vl-every '(lambda (n)
+          (or (<= 48 n 57) (<= 65 n 70) (<= 97 n 102))
+        )
+        (vl-string->list ref)
+      )
+    )
+    (strcase ref T)
+    (if (setq response (GitHub_SetupRequest
+          (strcat "https://api.github.com/repos/CODED1NG/GitLISP/commits/" (GitHub_SetupEscapeRef ref))
+          "application/vnd.github.sha"
+        )
+      )
+      (progn
+        (setq sha (vl-string-trim " \t\r\n" (cdr (assoc "text" response))))
+        (if (and
+            (= (strlen sha) 40)
+            (vl-every '(lambda (n)
+                (or (<= 48 n 57) (<= 65 n 70) (<= 97 n 102))
+              )
+              (vl-string->list sha)
+            )
+          )
+          (strcase sha T)
+          (progn
+            (prompt "\nGitLISP: GitHub did not return a full commit SHA.")
+            nil
+          )
+        )
+      )
+    )
+  )
+)
+
+;; response - binary HTTP result; filename - new path; expected - GitHub tree byte count.
+;; Returns T after size-verified creation, or nil. Never overwrites an existing file.
+(defun GitHub_SetupSaveFile (response filename expected / stream result bytes array count created)
+  (setq result
+    (vl-catch-all-apply
+      '(lambda ()
+        (setq bytes (cdr (assoc "bytes" response))
+          array (if (= (type bytes) 'VARIANT)
+            (vlax-variant-value bytes)
+            bytes
+          )
+        )
+        (if (and array (null (vl-file-size filename)) (not (vl-file-directory-p filename)))
+          (progn
+            (setq count (1+ (- (vlax-safearray-get-u-bound array 1) (vlax-safearray-get-l-bound array 1))))
+            (if (and (= count expected) (<= 1 count 5242880))
+              (progn
+                (setq stream (vlax-create-object "ADODB.Stream"))
+                (vlax-put-property stream 'Type 1)
+                (vlax-invoke stream 'Open)
+                (vlax-invoke-method stream 'Write bytes)
+                (vlax-invoke-method stream 'SaveToFile filename 1)
+                (setq created T)
+                (= count (vl-file-size filename))
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (if stream
+    (progn
+      (vl-catch-all-apply 'vlax-invoke-method (list stream 'Close))
+      (vlax-release-object stream)
+    )
+  )
+  (if (and (not (vl-catch-all-error-p result)) result)
+    T
+    (progn
+      (if (and created (vl-file-size filename))
+        (vl-file-delete filename)
+      )
+      nil
+    )
+  )
+)
+
 ;; paths - install paths. Returns T after writing the bundle activation manifest.
 ;; Written last so AutoCAD does not discover a half-copied application.
 (defun GitHub_SetupPackage (paths / stream line result)
@@ -448,7 +655,7 @@
           (progn
             (foreach line
               '("<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-                "<ApplicationPackage SchemaVersion=\"1.0\" AppVersion=\"1.0.0\" Name=\"3Ding GitHub\" Description=\"GitHub-backed AutoLISP loading\" Author=\"Denon Deterding\" ProductCode=\"{885A15C9-1E61-4EAA-80D5-F5F2EC3159A0}\" UpgradeCode=\"{BA3E6C93-9B2B-47A2-A853-85AE629BE249}\" Helpfile=\"./README.md\">"
+                "<ApplicationPackage SchemaVersion=\"1.0\" AppVersion=\"1.1.0\" Name=\"GitLISP\" Description=\"GitHub-backed AutoLISP loading\" Author=\"Denon Deterding\" ProductCode=\"{885A15C9-1E61-4EAA-80D5-F5F2EC3159A0}\" UpgradeCode=\"{BA3E6C93-9B2B-47A2-A853-85AE629BE249}\" Helpfile=\"./README.md\">"
                 "  <CompanyDetails Name=\"3Ding\" />"
                 "  <Components>"
                 "    <RuntimeRequirements OS=\"Win64\" Platform=\"AutoCAD*\" SeriesMin=\"R24.0\" />"
@@ -473,100 +680,470 @@
   (and (not (vl-catch-all-error-p result)) result)
 )
 
-;; source - selected GitHub.lsp; paths - destinations. Returns T after initial install.
-;; Existing installations are preserved; this version requires uninstall before upgrade.
-(defun GitHub_SetupInstall (source paths / parent state item from to created result)
-  (setq parent (vl-filename-directory source)
-    state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths)
+;; json - GitHub tree JSON text. Returns the parsed object/array lists.
+(defun GitHub_SetupJSON (json / data newData inStr dPrev strPos d n)
+  (setq data (vl-string->list json))
+  (foreach d data
+    (cond
+      ;if we're in a string, test length and continue
+      (inStr
+        (if (or (setq inStr (and (= 34 d) (/= 92 dPrev))) (<= strPos 2300)) ;[--- MAX string length is 2300 characters ---]
+          (setq strPos (1+ strPos) newData (cons d newData))
+        );if
+        (setq instr (not inStr))
+      );cond 1
+      ;this signals that we're starting a string
+      ((= 34 d) (setq inStr t strPos 1 newData (cons d newData)));cond 2
+      ;replacing relevant characters Outside of json object strings
+      ((member d '(44 58 91 93 123 125)) ; ("," ":" "[" "]" "{" "}")
+        (foreach n (cond
+            ((= 44 d) '(41 32 40)) ; ") ("
+            ((= 58 d) '(32)) ; " "
+            ((or (= 91 d) (= 123 d)) '(40 40)) ; "(("
+            ((or (= 93 d) (= 125 d)) '(41 41)) ; "))"
+          );cond
+          (setq newData (cons n newData))
+        );foreach
+      );cond 3
+      ;this handles numbers.. real/int, pos/neg
+      ((member d '(45 46 48 49 50 51 52 53 54 55 56 57)) ; ("-" "." "0" "1" "2" "3" "4" "5" "6" "7" "8" "9")
+        (setq newData (cons d newData))
+      );cond 4
+      ;these will signal a "true" value
+      ((or (= 116 d) (= 84 d)) ; ("t" "T")
+        (setq newData (cons 116 newData)) ; "t"
+      );cond 5
+      ;these will signal a "null" or "false" value (both are nil in lisp)
+      ((or (= 110 d) (= 102 d) (= 78 d) (= 70 d)) ; ("n" "f" "N" "F")
+        (foreach n '(110 105 108)
+          (setq newData (cons n newData))
+        ) ; "nil"
+      );cond 6
+    );cond
+    (setq dPrev d)
+  );foreach
+  (read (vl-list->string (reverse newData)))
+);defun
+
+;; tree - parsed Git tree. Returns the five required regular-file records, or nil.
+(defun GitHub_SetupPayload (tree / names records name wrapper entry found valid)
+  (setq names '("GitHub.lsp" "Install.lsp" "Deploy.ps1" "README.md" "LICENSE")
+    valid (and (assoc "tree" tree) (assoc "truncated" tree) (null (cadr (assoc "truncated" tree))))
   )
-  (cond
-    ((not (GitHub_SetupRootsSafe paths))
-      (prompt "\nGitHub setup: an installation path is unsafe or contains a reparse point.")
-      nil
-    )
-    ((vl-file-directory-p (cdr (assoc "bundle" paths)))
-      (if state
-        (if (vl-every
-            '(lambda (relative / file)
-              (setq file (strcat (cdr (assoc "bundle" paths)) "\\" relative))
-              (and (not (vl-file-directory-p file)) (vl-file-size file))
-            )
-            '("Contents\\GitHub.lsp" "Contents\\Install.lsp" "README.md" "LICENSE")
+  (foreach name names
+    (setq found nil)
+    (foreach wrapper (cadr (assoc "tree" tree))
+      (setq entry (car wrapper))
+      (if (equal name (cadr (assoc "path" entry)))
+        (if (and
+            (null found)
+            (equal (cadr (assoc "type" entry)) "blob")
+            (member (cadr (assoc "mode" entry)) '("100644" "100755"))
+            (= (type (cadr (assoc "size" entry))) 'INT)
+            (<= 1 (cadr (assoc "size" entry)) 5242880)
           )
-          (if (GitHub_SetupTrust paths state)
-            (if (vl-file-size (strcat (cdr (assoc "bundle" paths)) "\\PackageContents.xml"))
-              (prompt "\nGitHub: already installed. To upgrade, uninstall and install the new copy.")
-              (if (GitHub_SetupPackage paths)
-                (prompt "\nGitHub: setup repaired. Restart AutoCAD.")
-                (prompt "\nGitHub: bundle activation could not be written.")
-              )
-            )
-            (prompt "\nGitHub: installed files were preserved; profile setup is incomplete.")
-          )
-          (prompt "\nGitHub: installed files are incomplete. Run GITHUBUNINSTALL, then install again.")
+          (setq found (list (cons "name" name) (cons "size" (cadr (assoc "size" entry)))))
+          (setq valid nil)
         )
-        (prompt "\nGitHub setup: an unrecognized bundle already exists; it was preserved.")
       )
     )
-    (t
-      (setq result
-        (vl-catch-all-apply
-          '(lambda ()
-            (if (vl-every
-                '(lambda (name)
-                  (vl-file-size (strcat parent "\\" name))
-                )
-                '("GitHub.lsp" "Install.lsp" "README.md" "LICENSE")
+    (if found
+      (setq records (cons found records))
+      (progn
+        (prompt (strcat "\nGitLISP: required installer file is missing or invalid in the published revision: " name "."))
+        (setq valid nil)
+      )
+    )
+  )
+  (if valid
+    (reverse records)
+  )
+)
+
+;; filename - new data file; data - printable metadata. Returns T after writing and closing.
+(defun GitHub_SetupWriteData (filename data / stream result)
+  (setq result
+    (vl-catch-all-apply
+      '(lambda ()
+        (if (setq stream (GitHub_SetupOpen filename "w"))
+          (progn
+            (prin1 data stream)
+            (write-line "" stream)
+            (close stream)
+            (setq stream nil)
+            T
+          )
+        )
+      )
+    )
+  )
+  (if stream
+    (vl-catch-all-apply 'close (list stream))
+  )
+  (and (not (vl-catch-all-error-p result)) result)
+)
+
+;; directory - owned directory. Returns T when absent or removed empty, never recursively.
+(defun GitHub_SetupEmptyDir (directory / fso folder files folders result)
+  (setq fso (vlax-create-object "Scripting.FileSystemObject"))
+  (setq result
+    (vl-catch-all-apply
+      '(lambda ()
+        (if (and (GitHub_SetupOrdinary fso directory) (vl-file-directory-p directory))
+          (progn
+            (setq folder (vlax-invoke-method fso 'GetFolder directory)
+              files (vlax-get-property folder 'Files)
+              folders (vlax-get-property folder 'SubFolders)
+            )
+            (if (and (= 0 (vlax-get-property files 'Count)) (= 0 (vlax-get-property folders 'Count)))
+              (progn
+                (vlax-release-object files)
+                (setq files nil)
+                (vlax-release-object folders)
+                (setq folders nil)
+                (vlax-release-object folder)
+                (setq folder nil)
+                (vlax-invoke-method fso 'DeleteFolder directory :vlax-false)
+                T
               )
-              (if (GitHub_SetupMkdir (vl-filename-directory (cdr (assoc "bundle" paths))))
-                (if (setq created (vl-mkdir (cdr (assoc "bundle" paths))))
-                  (if (GitHub_SetupMkdir (cdr (assoc "contents" paths)))
-                    (progn
-                      (setq result T)
-                      (foreach item
-                        '(("GitHub.lsp" . "Contents\\GitHub.lsp")
-                          ("Install.lsp" . "Contents\\Install.lsp")
-                          ("README.md" . "README.md") ("LICENSE" . "LICENSE")
-                        )
-                        (setq from (strcat parent "\\" (car item))
-                          to (strcat (cdr (assoc "bundle" paths)) "\\" (cdr item))
-                        )
-                        (if (not (and (vl-file-copy from to) (= (vl-file-size from) (vl-file-size to))))
-                          (setq result nil)
+            )
+          )
+          (and (null (vl-file-size directory)) (not (vl-file-directory-p directory)))
+        )
+      )
+    )
+  )
+  (if files
+    (vlax-release-object files)
+  )
+  (if folders
+    (vlax-release-object folders)
+  )
+  (if folder
+    (vlax-release-object folder)
+  )
+  (vlax-release-object fso)
+  (and (not (vl-catch-all-error-p result)) result)
+)
+
+;; file - tracked file snapshot. Returns T when size/time still match.
+(defun GitHub_SetupSnapshotMatches (file)
+  (and
+    (not (vl-file-directory-p (car file)))
+    (vl-file-size (car file))
+    (equal (vl-file-size (car file)) (cadr file))
+    (equal (vl-file-systime (car file)) (caddr file))
+  )
+)
+
+;; ref - branch/tag/SHA; channel - Stable/Development.
+;; Returns 0 on success, 1 on failure, 1618 when busy, or 1003 for retained recovery data.
+;; Uses only AutoLISP/COM; no PowerShell policy change or script execution is needed.
+(defun GitLISPDeploy
+  (ref channel / paths bundle state created lock locked stage fresh backup slot response tree
+    payload entry relative filename stagePaths result reason sha pending current
+    target saved old installed moved item beforeTrust appliedTrust committed recovery code fso
+  )
+  (setq paths (GitHub_SetupPaths)
+    bundle (cdr (assoc "bundle" paths))
+    pending (strcat bundle "\\pending-deploy.json")
+    lock (strcat bundle "\\.deploy.lock")
+    beforeTrust (getvar "TRUSTEDPATHS")
+    code 1
+  )
+  (setq result
+    (vl-catch-all-apply
+      '(lambda ()
+        (cond
+          ((not (and (GitHub_SetupValidRef ref) (member channel '("Stable" "Development"))))
+            (setq reason "invalid deployment ref or channel.")
+          )
+          ((or (vl-file-size pending) (vl-file-directory-p pending))
+            (setq code 1003 reason "a deployment needs recovery; its backups were preserved.")
+          )
+          ((or (vl-file-size lock) (vl-file-directory-p lock))
+            (setq code 1618 reason "another installation or a stale deployment lock exists.")
+          )
+          ((not (GitHub_SetupRootsSafe paths)) (setq reason "an installation path is unsafe."))
+          ((and
+              (vl-file-directory-p bundle)
+              (null (setq state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths)))
+            )
+            (setq reason "an unrecognized bundle exists; it was preserved.")
+          )
+          ((or
+              (vl-file-size (strcat bundle "\\install.dat.bak"))
+              (vl-file-size (strcat bundle "\\install.dat.new"))
+            )
+            (setq code 1003 reason "setup ownership metadata needs recovery before deployment.")
+          )
+          (t
+            (if (not (vl-file-directory-p bundle))
+              (if (GitHub_SetupMkdir (vl-filename-directory bundle))
+                (setq created (vl-mkdir bundle))
+              )
+            )
+            (if (setq locked (vl-mkdir lock))
+              (progn
+                (setq slot 0)
+                (while (and (null stage) (< slot 1000))
+                  (setq filename (strcat bundle "\\.deploy-" (itoa (getvar "MILLISECS")) "-" (itoa slot)))
+                  (if (vl-mkdir filename)
+                    (setq stage filename)
+                  )
+                  (setq slot (1+ slot))
+                )
+                (if stage
+                  (progn
+                    (setq fresh (strcat stage "\\new") backup (strcat stage "\\backup"))
+                    (GitHub_SetupMkdir (strcat fresh "\\Contents"))
+                    (GitHub_SetupMkdir (strcat backup "\\Contents"))
+                    (prompt "\nGitLISP: resolving the requested build...")
+                    (setq sha (GitHub_SetupCommit ref))
+                    (if sha
+                      (setq response (GitHub_SetupRequest
+                          (strcat "https://api.github.com/repos/CODED1NG/GitLISP/git/trees/" sha "?recursive=1")
+                          "application/vnd.github+json"
                         )
                       )
-                      (setq state '(("product" . "3Ding.GitHub") ("version" . 1) ("profiles")))
-                      (and
-                        result
-                        (GitHub_SetupWriteState state paths)
-                        (GitHub_SetupTrust paths state)
-                        (GitHub_SetupPackage paths)
+                    )
+                    (if response
+                      (setq tree (GitHub_SetupJSON (cdr (assoc "text" response))) payload (GitHub_SetupPayload tree))
+                    )
+                    (if (null payload)
+                      (setq reason "the published installer files are unavailable or incomplete.")
+                    )
+                    (foreach entry payload
+                      (if (null reason)
+                        (progn
+                          (setq filename (cdr (assoc "name" entry))
+                            relative (if (member filename '("README.md" "LICENSE"))
+                              filename
+                              (strcat "Contents\\" filename)
+                            )
+                          )
+                          (prompt (strcat "\nGitLISP: downloading " filename "..."))
+                          (setq response (GitHub_SetupRequest
+                              (strcat "https://raw.githubusercontent.com/CODED1NG/GitLISP/" sha "/" filename)
+                              "application/octet-stream"
+                            )
+                          )
+                          (if (not (and
+                                response
+                                (GitHub_SetupSaveFile response (strcat fresh "\\" relative) (cdr (assoc "size" entry)))
+                              )
+                            )
+                            (setq reason (strcat "could not download and verify " filename "."))
+                          )
+                        )
+                      )
+                    )
+                    (if (null reason)
+                      (progn
+                        (if (null state)
+                          (setq state '(("product" . "3Ding.GitHub") ("version" . 1) ("profiles")))
+                        )
+                        (setq stagePaths (subst (cons "state" (strcat fresh "\\install.dat")) (assoc "state" paths) paths)
+                        )
+                        (if (not (and
+                              (GitHub_SetupWriteState state stagePaths)
+                              (GitHub_SetupWriteData (strcat fresh "\\release.dat")
+                                (list '("repository" . "CODED1NG/GitLISP") (cons "ref" ref)
+                                  (cons "commit" sha) (cons "channel" channel)
+                                )
+                              )
+                              (GitHub_SetupPackage (subst (cons "bundle" fresh) (assoc "bundle" paths) paths))
+                            )
+                          )
+                          (setq reason "could not prepare the staged application metadata.")
+                        )
+                      )
+                    )
+                    (if (null reason)
+                      (progn
+                        (setq current (GitHub_SetupOpen pending "w"))
+                        (if current
+                          (progn
+                            (write-line (strcat "{\"installer\":\"AutoLISP\",\"stage\":"
+                                (vl-prin1-to-string stage) ",\"commit\":\"" sha "\"}"
+                              ) current
+                            )
+                            (close current)
+                            (setq current nil)
+                          )
+                          (setq reason "could not record the deployment transaction.")
+                        )
+                      )
+                    )
+                    (if (null reason)
+                      (foreach relative
+                        '("PackageContents.xml" "install.dat" "Contents\\GitHub.lsp"
+                          "Contents\\Install.lsp" "Contents\\Deploy.ps1" "README.md" "LICENSE" "release.dat"
+                        )
+                        (if (null reason)
+                          (progn
+                            (setq target (strcat bundle "\\" relative)
+                              saved (strcat backup "\\" relative)
+                              old (if (vl-file-size target)
+                                (list saved (vl-file-size target) (vl-file-systime target))
+                              )
+                            )
+                            (if old
+                              (if (vl-file-rename target saved)
+                                (setq moved (cons (cons target old) moved))
+                                (setq reason "could not preserve an installed file for rollback.")
+                              )
+                            )
+                            (if (and (null reason) (/= relative "PackageContents.xml"))
+                              (if (vl-file-rename (strcat fresh "\\" relative) target)
+                                (setq installed (cons (list target (vl-file-size target) (vl-file-systime target)) installed))
+                                (setq reason "could not install a staged application file.")
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                    (if (null reason)
+                      (progn
+                        (setq current (GitHub_SetupTrust paths state)
+                          appliedTrust (getvar "TRUSTEDPATHS")
+                          target (strcat bundle "\\install.dat")
+                        )
+                        (if (vl-file-size target)
+                          (setq installed (subst
+                              (list target (vl-file-size target) (vl-file-systime target))
+                              (assoc target installed) installed
+                            )
+                          )
+                        )
+                        (if (not current)
+                          (setq reason "this profile's trust settings could not be configured.")
+                        )
+                      )
+                    )
+                    (if (null reason)
+                      (if (vl-file-rename (strcat fresh "\\PackageContents.xml") (strcat bundle "\\PackageContents.xml"))
+                        (setq committed T code 0)
+                        (setq reason "could not activate the installed bundle.")
                       )
                     )
                   )
+                  (setq reason "could not create a staging transaction.")
                 )
               )
+              (setq code 1618 reason "could not acquire the installation lock.")
             )
           )
         )
       )
-      (cond
-        ((and result (not (vl-catch-all-error-p result)))
-          (prompt "\nGitHub: installed successfully. Restart AutoCAD to activate in all drawings.")
-          (prompt "\nGitHub: the bundle loads the tool; repository loading remains explicit.")
-          T
-        )
-        (t
-          (setq state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths))
-          (if (and created (or (null state) (GitHub_SetupRemoveTrust state)))
-            (GitHub_SetupDeleteTree (cdr (assoc "bundle" paths)) (cdr (assoc "bundle" paths)))
+    )
+  )
+  (if current
+    (vl-catch-all-apply 'close (list current))
+  )
+  (if (and (not committed) locked)
+    (progn
+      (if (and appliedTrust (not (equal beforeTrust (getvar "TRUSTEDPATHS"))))
+        (if (and
+            (equal appliedTrust (getvar "TRUSTEDPATHS"))
+            (not (vl-catch-all-error-p (vl-catch-all-apply 'setvar (list "TRUSTEDPATHS" beforeTrust))))
           )
-          (prompt "\nGitHub setup: installation did not complete. Check file access and TRUSTEDPATHS.")
           nil
+          (setq recovery T)
+        )
+      )
+      (foreach item installed
+        (cond
+          ((vl-file-directory-p (car item)) (setq recovery T))
+          ((vl-file-size (car item))
+            (if (not (and (GitHub_SetupSnapshotMatches item) (vl-file-delete (car item))))
+              (setq recovery T)
+            )
+          )
+        )
+      )
+      (foreach item moved
+        (if (not (and
+              (null (vl-file-size (car item)))
+              (GitHub_SetupSnapshotMatches (cdr item))
+              (vl-file-rename (cadr item) (car item))
+            )
+          )
+          (setq recovery T)
         )
       )
     )
   )
+  (if (and stage (not recovery))
+    (progn
+      (setq fso (vlax-create-object "Scripting.FileSystemObject"))
+      (setq current (vl-catch-all-apply 'GitHub_SetupDeleteWalk (list fso stage stage)))
+      (vlax-release-object fso)
+      (if (or (null current) (vl-catch-all-error-p current))
+        (setq recovery T)
+      )
+    )
+  )
+  (if (and locked (not recovery) (vl-file-size pending))
+    (vl-file-delete pending)
+  )
+  (if locked
+    (if (not (GitHub_SetupEmptyDir lock))
+      (setq recovery T)
+    )
+  )
+  (if recovery
+    (setq code 1003)
+  )
+  (if (and created (not committed) (not recovery))
+    (progn
+      (GitHub_SetupEmptyDir (strcat bundle "\\Contents"))
+      (GitHub_SetupEmptyDir bundle)
+    )
+  )
+  (cond
+    (recovery
+      (prompt (strcat "\nGitLISP: deployment recovery is needed. Backups remain in " stage "."))
+    )
+    (committed
+      (prompt (strcat "\nGitLISP: installed " channel " build " (substr sha 1 12) ". Restart AutoCAD."))
+    )
+    (t
+      (prompt (strcat "\nGitLISP: installation did not complete: "
+          (cond
+            (reason reason)
+            ((vl-catch-all-error-p result) (vl-catch-all-error-message result))
+            (t "download or file access failed.")
+          )
+        )
+      )
+    )
+  )
+  code
+)
+
+;; No inputs. One Yes/No popup authorizes a normal online install/update.
+;; Returns nothing visible; progress and the final result appear as plain text.
+(defun C:GITHUBINSTALL ( / *error* shell answer result)
+  (setq *error* GitHub_SetupError)
+  (setq shell (vl-catch-all-apply 'vlax-create-object '("WScript.Shell")))
+  (if (and shell (not (vl-catch-all-error-p shell)))
+    (progn
+      (setq answer (vlax-invoke-method shell 'Popup
+          "Install or update GitLISP from CODED1NG/GitLISP on GitHub?\n\nSetup configures the application and cache trust paths. Existing cached sources are kept.\n\nRestart AutoCAD afterward."
+          0 "GitLISP setup" 292
+        )
+      )
+      (vlax-release-object shell)
+      (if (= answer 6)
+        (setq result (GitLISPDeploy "main" "Stable"))
+        (prompt "\nGitLISP: installation cancelled.")
+      )
+    )
+    (prompt "\nGitLISP: Windows Script Host is unavailable. Use managed Deploy.ps1 installation.")
+  )
+  (princ)
 )
 
 ;; message - native error text. Prints unexpected errors; cancellation exits quietly.
@@ -574,35 +1151,6 @@
 (defun GitHub_SetupError (message)
   (if (not (wcmatch (strcase message) "*CANCEL*,*QUIT*,*BREAK*"))
     (prompt (strcat "\nGitHub setup: " message))
-  )
-  (princ)
-)
-
-;; No inputs. Guides initial installation; returns nothing visible.
-(defun C:GITHUBINSTALL ( / *error* paths source answer result)
-  (setq *error* GitHub_SetupError)
-  (setq paths (GitHub_SetupPaths))
-  (prompt "\n3Ding GitHub installation")
-  (prompt (strcat "\nApplication: " (cdr (assoc "bundle" paths))))
-  (prompt (strcat "\nCache: " (cdr (assoc "data" paths))))
-  (prompt "\nSetup adds only the application folder and cache subfolders to TRUSTEDPATHS.")
-  (setq source (getfiled "Select GitHub.lsp from the extracted release folder" "GitHub.lsp" "lsp" 16)
-  )
-  (if source
-    (progn
-      (initget "Yes No")
-      (setq answer (getkword "\nInstall for this Windows user? [Yes/No] <No>: "))
-      (if (= answer "Yes")
-        (progn
-          (setq result (vl-catch-all-apply 'GitHub_SetupInstall (list source paths)))
-          (if (vl-catch-all-error-p result)
-            (prompt (strcat "\nGitHub setup: " (vl-catch-all-error-message result)))
-          )
-        )
-        (prompt "\nGitHub setup: cancelled.")
-      )
-    )
-    (prompt "\nGitHub setup: cancelled.")
   )
   (princ)
 )
@@ -649,8 +1197,22 @@
     data (cdr (assoc "data" paths))
     state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths)
   )
+  (if (or
+      (vl-file-size (strcat bundle "\\pending-deploy.json"))
+      (vl-file-size (strcat bundle "\\.deploy.lock"))
+    )
+    (progn
+      (setq state nil)
+      (prompt "\nGitLISP: deployment is active or needs recovery. Preserve its backups and contact your CAD manager.")
+    )
+  )
   (if (null state)
-    (prompt "\nGitHub: no recognized installation found. GITHUBCLEARCACHE can remove cached data.")
+    (if (and
+        (null (vl-file-size (strcat bundle "\\pending-deploy.json")))
+        (null (vl-file-size (strcat bundle "\\.deploy.lock")))
+      )
+      (prompt "\nGitHub: no recognized installation found. GITHUBCLEARCACHE can remove cached data.")
+    )
     (progn
       (prompt (strcat "\nApplication to remove: " bundle "\nAll tool data to remove: " data))
       (prompt "\nInstaller-added trust entries are removed from recorded AutoCAD profiles.")
@@ -693,34 +1255,87 @@
   (princ)
 )
 
-;; No inputs. Prints installation/profile/cache details; returns nothing visible.
-(defun C:GITHUBSTATUS ( / *error* paths state)
-  (setq *error* GitHub_SetupError)
-  (setq paths (GitHub_SetupPaths) state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths))
-  (prompt (strcat "\n3Ding GitHub: " (if state
+;; paths - fixed setup paths. Returns validated build metadata, or nil.
+(defun GitHub_SetupRelease (paths / filename stream value result)
+  (setq filename (strcat (cdr (assoc "bundle" paths)) "\\release.dat"))
+  (setq result
+    (vl-catch-all-apply
+      '(lambda ()
+        (if (setq stream (GitHub_SetupOpen filename "r"))
+          (progn
+            (setq value (read (read-line stream)))
+            (if (and
+                (= (length value) 4)
+                (equal (cdr (assoc "repository" value)) "CODED1NG/GitLISP")
+                (GitHub_SetupValidRef (cdr (assoc "ref" value)))
+                (member (cdr (assoc "channel" value)) '("Stable" "Development"))
+                (= (type (cdr (assoc "commit" value))) 'STR)
+                (= (strlen (cdr (assoc "commit" value))) 40)
+              )
+              value
+            )
+          )
+        )
+      )
+    )
+  )
+  (if stream
+    (vl-catch-all-apply 'close (list stream))
+  )
+  (if (not (vl-catch-all-error-p result))
+    result
+  )
+)
+
+;; No inputs. Prints installation/profile/build/cache details; returns nothing visible.
+(defun C:GITHUBSTATUS ( / *error* paths state release)
+  (setq *error* GitHub_SetupError
+    paths (GitHub_SetupPaths)
+    state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths)
+    release (GitHub_SetupRelease paths)
+  )
+  (prompt (strcat "\nGitLISP: " (if state
         "installed"
-        "running without a registered installation"
+        "not installed"
       )
     )
   )
   (prompt (strcat "\nProfile: " (getvar "CPROFILE")))
+  (if release
+    (prompt (strcat "\nBuild: " (cdr (assoc "channel" release)) " / "
+        (cdr (assoc "ref" release)) " / " (substr (cdr (assoc "commit" release)) 1 12)
+      )
+    )
+  )
   (prompt (strcat "\nApplication: " (cdr (assoc "bundle" paths))))
   (prompt (strcat "\nCache: " (cdr (assoc "data" paths))))
+  (if (vl-file-size (strcat (cdr (assoc "bundle" paths)) "\\pending-deploy.json"))
+    (prompt "\nDeployment recovery is pending; backups have been preserved.")
+  )
   (princ)
 )
 
-;; No inputs. Enrolls a newly used AutoCAD profile in an existing per-user installation.
-;; Returns nothing visible; locked profiles are reported without changing SECURELOAD.
+;; No inputs. Installed bundles enroll the active profile without dialogs.
+;; A standalone APPLOAD asks once to install, unless a managed caller suppresses it.
+;; Returns nothing visible; never changes SECURELOAD or execution policy.
 (defun GitHub_SetupStart ( / paths state result)
   (setq paths (GitHub_SetupPaths) state (GitHub_SetupReadState (cdr (assoc "state" paths)) paths))
-  (if state
-    (progn
+  (cond
+    ((or
+        (vl-file-size (strcat (cdr (assoc "bundle" paths)) "\\pending-deploy.json"))
+        (vl-file-size (strcat (cdr (assoc "bundle" paths)) "\\.deploy.lock"))
+          (vl-file-directory-p (strcat (cdr (assoc "bundle" paths)) "\\.deploy.lock"))
+      )
+      (prompt "\nGitLISP: deployment is active or needs recovery; setup was deferred.")
+    )
+    (state
       (setq result (vl-catch-all-apply 'GitHub_SetupTrust (list paths state)))
       (if (or (null result) (vl-catch-all-error-p result))
-        (prompt "\nGitHub setup: profile trust setup is incomplete. Run GITHUBINSTALL or contact your CAD administrator.")
+        (prompt "\nGitLISP: profile trust setup is incomplete; contact your CAD administrator.")
       )
     )
-    (prompt "\n3Ding GitHub setup ready. Type GITHUBINSTALL to begin.")
+    (*GitLISP-SuppressInstallPrompt* (prompt "\nGitLISP: managed setup functions loaded."))
+    (t (C:GITHUBINSTALL))
   )
   (princ)
 )
