@@ -152,31 +152,44 @@ filesystem reparse points and locations outside the tool's fixed paths.
 
 ### Managed deployment
 
-Deploy the same bundle without dialogs using **Deploy.ps1** through IT's normal
-management tool, a user-logon task, or a remote management session. Run in the
-**target user's Windows context**, not SYSTEM or a service account.
-For Intune, use logged-on credentials and the 64-bit PowerShell host. Respect
-IT's script-signing/execution policy; the installer does not override it.
+**Deploy.ps1** is the silent Windows PowerShell installer for IT deployment or
+user-logon scripts. Run it as **the user who will use AutoCAD**, with AutoCAD
+closed. For Intune, select logged-on credentials and 64-bit PowerShell. Existing
+script-signing/execution policies still apply.
 
-Close AutoCAD before managed deployment. An active session returns exit code
-1618 so IT can retry during a maintenance/logon window.
+Download [Deploy.ps1](https://github.com/CODED1NG/GitLISP/blob/main/Deploy.ps1)
+and run the examples from its folder in PowerShell.
+
+**Choose the version to install.** A *commit* is a saved revision of the project.
+Its *SHA* is a unique, 40-character ID. *Pinning* means using that ID so every
+user receives the exact revision you tested, even after newer code is published.
+
+| `-Ref` value | Meaning |
+| --- | --- |
+| `main` | Latest commit on the main development line (a *branch*) |
+| A tag name | A named revision, such as a published version tag |
+| Full commit SHA | One exact revision; recommended for production |
+
+After testing a build, find it in the [commit history](https://github.com/CODED1NG/GitLISP/commits/main/)
+and copy its full SHA. `GITHUBSTATUS` shows only its first 12 characters; the
+installed bundle's `release.dat` contains the full ID. Replace
+`PASTE_FULL_COMMIT_SHA_HERE` below with that ID, keeping the quotation marks.
 
 ```powershell
-# Production: pin the full commit SHA that you tested.
-powershell.exe -NoProfile -NonInteractive -File .\Deploy.ps1 -Ref "<40-character-tested-SHA>"
+# Production: install exactly the build you tested.
+powershell.exe -NoProfile -NonInteractive -File .\Deploy.ps1 -Ref "PASTE_FULL_COMMIT_SHA_HERE"
 
-# Pilot users: explicitly select a development branch or tag.
-powershell.exe -NoProfile -NonInteractive -File .\Deploy.ps1 -Ref "dev" -Channel Development
+# Pilot: test the current main branch before wider deployment.
+powershell.exe -NoProfile -NonInteractive -File .\Deploy.ps1 -Ref "main" -Channel Development
 ```
 
-`dev` is an example branch name; create it first or supply an existing ref.
-Both channels use the same install paths, rather than separate installations.
+`-Channel` labels a build as `Stable` (the default) or `Development`; `-Ref`
+selects the actual code. Both channels share the same installation location.
 `GITHUBSTATUS` displays the channel, requested ref, and installed commit.
 
-The managed installer verifies downloaded sizes and Git blob hashes, records
-ownership of added trust entries in existing AutoCAD profiles, and preserves
-source caches during updates. File/profile failures trigger rollback. Backups
-and a transaction record remain when rollback cannot complete.
+Deployment verifies downloaded sizes and Git file hashes, preserves caches, and
+records added trust entries. Failures trigger rollback; incomplete rollback
+preserves backups for recovery.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -192,21 +205,20 @@ commit. An existing bundle alone does not establish the intended version.
 
 ### Silent deployment from AutoCAD
 
-For an authorized CAD-startup script, suppress the normal APPLOAD popup in a
-temporary local scope, then call the data-returning deployment entry point:
+For a CAD-startup script, load your managed copy of `Install.lsp` with its popup
+suppressed. `GitLISPDeploy` accepts a revision and channel, runs without dialogs,
+and returns an exit code from the table above:
 
 ```lisp
 ((lambda (/ *GitLISP-SuppressInstallPrompt* code)
    (setq *GitLISP-SuppressInstallPrompt* T)
    (load "C:/managed/Install.lsp")
-   (setq code (GitLISPDeploy "<40-character-tested-SHA>" "Stable"))
+   (setq code (GitLISPDeploy "PASTE_FULL_COMMIT_SHA_HERE" "Stable"))
    (princ)
 ))
 ```
 
-`GitLISPDeploy` makes no dialogs and returns the exit code. Use `"Development"`
-with an explicit branch/tag for pilots. Downloaded repository code still loads
-only through your explicit `GitHubLoad`/autoload setup.
+Replace the local installer path and commit placeholder before use.
 
 ### Private source access
 
@@ -217,61 +229,120 @@ Do not embed tokens in deployment command lines or checked-in scripts.
 
 ### Publishing an installer update
 
-Push `Install.lsp`, `Deploy.ps1`, `GitHub.lsp`, `README.md`, and `LICENSE` together
-before testing an online install against that revision. The bootstrap cannot
-download local changes that have not been published. A revision missing any
-required file is rejected before the application is replaced.
+Publish `Install.lsp`, `Deploy.ps1`, `GitHub.lsp`, `README.md`, and `LICENSE`
+together before online testing. Unpublished changes cannot be downloaded;
+revisions missing a required file are rejected before replacement.
 
 </details>
 
 ## For AutoLISP developers
 
 <details>
-<summary>Script calls, authentication, and deferred loading</summary>
+<summary>Functions, authentication, rate limits, and deferred loading</summary>
 
-The commands above cover normal use. These examples are for scripts and CAD
-startup configuration.
+### Calling GitLISP from a script
 
-Use one URL per call. Normal calls print readable status text and finish
-silently, without returning a data dump to command history.
+Once GitLISP is installed and loaded, these functions let an AutoLISP script
+perform the same work as the interactive commands, without asking for a URL.
+
+| Function call | Purpose |
+| --- | --- |
+| `(GitHubPreview url token)` | Print planned file counts and conflicts without installing files |
+| `(GitHubSync url token)` | Download/update files without executing them |
+| `(GitHubLoad url token)` | Sync, then load the selected AutoLISP files |
+| `(GitHubAutoload url commands token)` | Register commands that load a file on first use |
+
+`url` is a quoted GitHub repository, folder, or file address. `token` is `nil`
+for public access, or an access-token string for authenticated access.
+`commands` is a list of command names, explained below. These functions print
+readable messages and finish without returning a visible data dump.
+
+Replace the example address with your own. Preview, download, and load are
+separate choices; you can call `GitHubLoad` directly.
 
 ```lisp
-(GitHubLoad "https://github.com/your-org/cad-tools" nil)
-
-(GitHubLoad
-  "https://github.com/your-org/cad-tools/tree/main/Tools"
-  nil
-)
-
-(GitHubLoad
-  "https://github.com/your-org/cad-tools/blob/main/Tools/example.lsp"
-  nil
-)
-
-(GitHubSync "https://github.com/your-org/cad-tools" nil)
-(GitHubPreview "https://github.com/your-org/cad-tools" nil)
+(setq toolURL "https://github.com/your-org/cad-tools/blob/main/example.lsp")
+(GitHubPreview toolURL nil)
+(GitHubSync toolURL nil)
+(GitHubLoad toolURL nil)
 ```
 
-Raw GitHub file URLs, slash-containing branch names, and UTF-8/percent-encoded
-paths are supported. The repository owner and name use GitHub's ASCII spelling.
+Repository/folder addresses select files recursively. Raw-file addresses,
+branch names containing slashes, and UTF-8/percent-encoded paths are supported.
 
-For authentication, pass a token string rather than `nil`. For example, if
-you configured a `GITHUB_TOKEN` environment variable:
+### Authentication
+
+A *personal access token* is a password-like secret that identifies your GitHub
+account. It enables private access where permitted and a higher API allowance.
+Create one using [GitHub's token instructions](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens),
+with only the repository access and read permissions needed.
+
+Have your deployment tooling or CAD manager set a Windows environment variable
+named `GITHUB_TOKEN` before starting AutoCAD. An environment variable is a named
+value a running application can read; this example passes its value explicitly:
 
 ```lisp
 (GitHubLoad "https://github.com/your-org/private-tools" (getenv "GITHUB_TOKEN"))
 ```
 
-The tool does not save tokens in its files, setup records, or command stubs.
+`getenv` returns `nil` if the variable is missing, giving anonymous access.
+GitLISP does not automatically read `GITHUB_TOKEN` or save supplied tokens.
+Keep token values out of source files and command history. The installers use
+the separate variable `GITLISP_TOKEN`.
+
+### Rate limits: where they apply and what to do
+
+GitHub limits automated requests to its *REST API*, the service GitLISP uses to
+retrieve repository file lists. The usual hourly allowances are:
+
+| Access | Allowance |
+| --- | --- |
+| Anonymous (`nil`) | 60 requests per public IP address; an office may share this |
+| Personal access token | 5,000 requests per account, shared with other account activity |
+
+Tokens from the same account do not create separate allowances. GitHub also
+limits bursts of requests, including authenticated ones. See [GitHub's rate-limit guide](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+
+| GitLISP operation | Uses this REST allowance? |
+| --- | --- |
+| Fetch a new/changed repository's file list | Yes; normally one tree request |
+| Installer: resolve a branch/tag and fetch its file list | Yes; normally two requests, or one with a full commit SHA |
+| Check Git refs or download raw files | No; separate GitHub restrictions can still apply |
+| Read already-cached files | No; an online refresh may precede loading |
+
+For example, a first sync of a 200-file repository normally needs **one REST
+tree request**, plus 200 raw-file downloads. It does not consume 200 REST requests.
+GitLISP's four-hour check interval and reuse of unchanged inventories reduce calls.
+
+**If blocked:** keep the cache, wait for GitHub's reset time or `Retry-After`
+delay, and retry later. For a burst limit without timing, wait at least a minute
+and increase delays if it persists. Spread team deployments over time.
+Use the authenticated example above when anonymous access is insufficient.
+Authentication raises the allowance; it does not remove limits.
+[GitHub's retry guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#handle-rate-limit-errors-appropriately)
+explains these response headers.
+
+GitLISP saves anonymous REST pauses across sessions and can use an intact cache
+when refresh fails. Authenticated pauses stop further REST calls within that
+operation; callers must wait before starting another. Installers stop on HTTP
+errors and need a later retry. HTTP 403 can also mean access was denied; check
+permissions if waiting does not resolve it.
 
 ### Programmatic results
 
 Scripts that need association lists can call `GitHub_Load`, `GitHub_Sync`,
 `GitHub_Preview`, or `GitHub_Autoload` with the same arguments as their normal
-counterparts. These internal data-returning functions are separate from the
-quiet user-facing calls.
+counterparts. An association list contains named values your script can inspect:
+
+```lisp
+(setq result (GitHub_Preview toolURL nil))
+(cdr (assoc "status" result)) ; Read the preview status; nil if no result.
+```
 
 ### Deferred commands
+
+*Autoload* downloads a file now but waits to execute it until a registered
+command is used. Replace the URL and command names with ones your file defines:
 
 ```lisp
 (GitHubAutoload
@@ -281,11 +352,9 @@ quiet user-facing calls.
 )
 ```
 
-Autoload requires an explicit file URL and command names without `C:` prefixes.
-Registration syncs without executing the file and leaves existing command
-definitions alone. First command use checks and loads the installed file, then
-runs the command. Command use makes no sync requests. The source must define
-the requested command.
+Use a file URL and command names without `C:`. Registration preserves existing
+commands. First use checks and loads the cached file, then runs its command;
+command use makes no sync requests.
 
 ### File selection and cache details
 
