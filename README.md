@@ -49,9 +49,28 @@ and which commands they add to AutoCAD.
    its commands available; GitLISP does not know which command you want to run.
    Some tools may also run actions immediately when loaded.
 
-For example, if a tool's README says to run `MYTOOL`, type **MYTOOL** after
-GitLISP finishes loading it. `MYTOOL` is only an example; use the actual command
-listed by that tool's author. The filename and command name may be different.
+### Try HELLOWORLD
+
+This project's [HELLOWORLD example](examples/HELLOWORLD.lsp) prints a greeting
+without changing your drawing:
+
+1. Type **GITHUBLOAD** in AutoCAD and press **Enter**.
+2. At **GitHub URL:**, paste this address and press **Enter**:
+
+   ```text
+   https://github.com/CODED1NG/GitLISP/blob/main/examples/HELLOWORLD.lsp
+   ```
+
+3. When loading finishes, type **HELLOWORLD** and press **Enter**. You should see:
+
+   ```text
+   Hello, world! Loaded from GitHub with GitLISP.
+   ```
+
+For other tools, use the command listed by their author. A filename and its
+command name may be different.
+
+### Choosing other tools
 
 Choose a file address when you only want one tool. A folder or repository
 address loads every eligible tool in that location, including its subfolders.
