@@ -1127,7 +1127,7 @@
 )
 
 ;; No inputs. One Yes/No popup authorizes a normal online install/update.
-;; Returns nothing visible; progress and the final result appear as plain text.
+;; Success shows an OK popup as well as command-line status. Returns nothing visible.
 (defun C:GITHUBINSTALL ( / *error* shell answer result)
   (setq *error* GitHub_SetupError)
   (setq shell (vl-catch-all-apply 'vlax-create-object '("WScript.Shell")))
@@ -1138,11 +1138,21 @@
           0 "GitLISP setup" 292
         )
       )
-      (vlax-release-object shell)
       (if (= answer 6)
-        (setq result (GitLISPDeploy "main" "Stable"))
+        (progn
+          (setq result (GitLISPDeploy "main" "Stable"))
+          (if (= result 0)
+            (vl-catch-all-apply 'vlax-invoke-method
+              (list shell 'Popup
+                "GitLISP was installed successfully.\n\nRestart AutoCAD to finish setup. Then type GITHUBHELP in the command line to get started."
+                0 "GitLISP setup complete" 64
+              )
+            )
+          )
+        )
         (prompt "\nGitLISP: installation cancelled.")
       )
+      (vlax-release-object shell)
     )
     (prompt "\nGitLISP: Windows Script Host is unavailable. Use managed Deploy.ps1 installation.")
   )
@@ -1327,7 +1337,7 @@
     ((or
         (vl-file-size (strcat (cdr (assoc "bundle" paths)) "\\pending-deploy.json"))
         (vl-file-size (strcat (cdr (assoc "bundle" paths)) "\\.deploy.lock"))
-          (vl-file-directory-p (strcat (cdr (assoc "bundle" paths)) "\\.deploy.lock"))
+        (vl-file-directory-p (strcat (cdr (assoc "bundle" paths)) "\\.deploy.lock"))
       )
       (prompt "\nGitLISP: deployment is active or needs recovery; setup was deferred.")
     )
